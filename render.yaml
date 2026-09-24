@@ -1,0 +1,18 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# Deploy from the Render dashboard with New > Blueprint and this repo.
+services:
+  - type: web
+    name: api-dev-tutor-bot
+    runtime: docker
+    plan: free # 0.1 CPU, 512 MB; sleeps after 15 min without traffic
+    region: oregon
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit # redeploy on every push to main
+    envVars:
+      # Hugging Face read token; entered in the dashboard, never committed.
+      - key: HF_API_KEY
+        sync: false
+      # Optional: set CORS_ORIGINS in the dashboard to your frontend's URL.
