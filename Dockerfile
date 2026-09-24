@@ -31,8 +31,9 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
-# Run as an unprivileged user.
-RUN groupadd --system app && useradd --system --gid app --home-dir /app app
+# Run as an unprivileged user with UID 1000, which Hugging Face Spaces
+# requires (it runs containers as UID 1000).
+RUN groupadd --gid 1000 app && useradd --uid 1000 --gid app --home-dir /app app
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --from=builder --chown=app:app /app/.cache/huggingface /app/.cache/huggingface
