@@ -1,0 +1,19 @@
+# Secrets: pass env vars at runtime instead
+.env
+**/.env
+**/.env.*
+
+# Local environment and caches
+.venv
+__pycache__/
+*.py[oc]
+build/
+dist/
+*.egg-info
+
+# Not needed in the image
+.git
+.gitignore
+.dockerignore
+Dockerfile
+CLAUDE.md
