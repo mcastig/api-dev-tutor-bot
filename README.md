@@ -6,16 +6,16 @@ It's designed to be called by a separate React frontend.
 
 ## How it works
 
-1. **At startup**, every Markdown file in `docs_angular/` is split into ~500-character chunks, embedded locally with [`sentence-transformers/all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2), and indexed in an in-memory FAISS store.
+1. **At startup**, every Markdown file in `docs_angular/` is split into ~500-character chunks, embedded with the multilingual [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) through the Hugging Face Inference API, and indexed in an in-memory FAISS store. The multilingual model lets Spanish questions match the English docs.
 2. **On each question**, the 2 most similar chunks are retrieved and passed, with the question, to [`Qwen/Qwen3-4B-Instruct-2507`](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) through [Hugging Face Inference Providers](https://huggingface.co/docs/inference-providers). The prompt tells the model to answer only from the provided docs.
 3. **The response** includes the answer and the chunks it was based on.
 
-Built with FastAPI, LangChain (`langchain-classic`, `langchain-huggingface`, `langchain-community`), FAISS, and sentence-transformers.
+Built with FastAPI, LangChain (`langchain-classic`, `langchain-huggingface`, `langchain-community`), and FAISS. Both models run remotely on Hugging Face, so the app needs no GPU or PyTorch and uses about 130 MB of RAM.
 
 ## Requirements
 
 - Python 3.12 and [uv](https://docs.astral.sh/uv/)
-- A [Hugging Face access token](https://huggingface.co/settings/tokens) with permission to make calls to Inference Providers. Usage beyond Hugging Face's monthly free credits is billed to your account.
+- A [Hugging Face access token](https://huggingface.co/settings/tokens) with permission to make calls to Inference Providers (a read token is enough). It's used for both the embeddings and the LLM. Usage beyond Hugging Face's monthly free credits is billed to your account.
 
 ## Getting started
 
@@ -36,7 +36,7 @@ Start the dev server from the repository root:
 uv run fastapi dev
 ```
 
-The API runs at http://127.0.0.1:8000, with interactive docs at http://127.0.0.1:8000/docs. Startup takes a few seconds while the docs are embedded; the first run also downloads the embedding model (~90 MB).
+The API runs at http://127.0.0.1:8000, with interactive docs at http://127.0.0.1:8000/docs. Startup takes a few seconds while the docs are embedded through the Hugging Face API; the server refuses to start without `HF_API_KEY`.
 
 ## API
 
@@ -86,7 +86,19 @@ docker run -d -p 8000:8000 \
   api-dev-tutor-bot
 ```
 
-The image uses CPU-only PyTorch, includes the embedding model and the `docs_angular/` knowledge base, runs as a non-root user, and has a health check on `/api/health`. `.env` is never copied into the image.
+The image (~650 MB) includes the `docs_angular/` knowledge base, runs as a non-root user, listens on `$PORT` if set (otherwise 8000), and has a health check on `/api/health`. `.env` is never copied into the image.
+
+## Deploy to Render (free)
+
+`render.yaml` defines a Docker web service on Render's free plan (0.1 CPU, 512 MB RAM; the app uses ~130 MB).
+
+1. Sign in at https://dashboard.render.com with GitHub.
+2. Click **New > Blueprint** and select this repository.
+3. Enter your Hugging Face read token for `HF_API_KEY` when prompted, then deploy.
+4. Once live, the API is at `https://<service-name>.onrender.com` (check `/api/health`).
+5. Optionally, add `CORS_ORIGINS` with your frontend's URL under the service's **Environment** settings.
+
+Every push to `main` redeploys automatically. On the free plan, the service sleeps after 15 minutes without traffic; the next request waits for it to wake up and embed the docs again (about a minute or more).
 
 ## Knowledge base
 
@@ -110,6 +122,7 @@ To add a topic, drop a `.md` file into `docs_angular/` and restart the server. T
 
 ## Known limitations
 
-- **Spanish questions retrieve worse than English ones.** The docs are in English and the embedding model is English-only. A multilingual embedding model would fix this.
+- **Retrieval isn't perfect across languages.** The multilingual embeddings help Spanish questions find the English docs, but some questions still miss the right section.
 - **Only 2 chunks are retrieved per question**, which is sometimes too little context. The model can then answer with wrong details, such as incorrect syntax.
 - **Doc changes need a restart**; the index is built once at startup and kept in memory.
+- **Startup depends on Hugging Face**: the docs are embedded through the API on every start, so the server can't start if the API is unreachable.
