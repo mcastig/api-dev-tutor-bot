@@ -118,7 +118,8 @@ app = FastAPI(title="DevTutor Bot API", version="1.0", lifespan=lifespan)
 DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://localhost:3000"
 CORS_ORIGINS = [
     origin.strip().rstrip("/")
-    for origin in os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
+    # `or`, not a getenv default, so an empty CORS_ORIGINS also uses the defaults.
+    for origin in (os.getenv("CORS_ORIGINS") or DEFAULT_CORS_ORIGINS).split(",")
     if origin.strip()
 ]
 
