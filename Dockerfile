@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# ---- Build stage: install dependencies and download the embedding model ----
+# ---- Build stage: install dependencies ----
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
 
 WORKDIR /app
@@ -19,35 +19,25 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     uv sync --locked --no-dev --no-install-project
 
-# Download the embedding model at build time so containers don't download it
-# on every start. Keep the model name in sync with server.py.
-ENV HF_HOME=/app/.cache/huggingface
-RUN /app/.venv/bin/python -c \
-    "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
-
-# ---- Runtime stage: slim image with only the venv, model, and app code ----
+# ---- Runtime stage: slim image with only the venv and app code ----
 FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
-# Run as an unprivileged user with UID 1000, which Hugging Face Spaces
-# requires (it runs containers as UID 1000).
+# Run as an unprivileged user (UID 1000, which some hosts such as Hugging
+# Face Spaces expect).
 RUN groupadd --gid 1000 app && useradd --uid 1000 --gid app --home-dir /app app
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
-COPY --from=builder --chown=app:app /app/.cache/huggingface /app/.cache/huggingface
 COPY --chown=app:app src/server.py ./src/server.py
 
 # Knowledge base read by get_retriever() (relative to WORKDIR), embedded at
 # startup.
 COPY --chown=app:app docs_angular/ ./docs_angular/
 
-# No HF_HUB_OFFLINE here: it would also block the LLM calls to Hugging Face
-# Inference Providers. The embedding model is still loaded from the cache above.
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1 \
-    HF_HOME=/app/.cache/huggingface
+    PYTHONUNBUFFERED=1
 
 USER app
 

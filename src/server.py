@@ -6,7 +6,8 @@ local Markdown docs and passed as context to a small LLM served by Hugging
 Face Inference Providers.
 
 Environment variables (loaded from src/.env):
-    HF_API_KEY: Required. Hugging Face access token used to call the LLM.
+    HF_API_KEY: Required. Hugging Face access token (read access is enough)
+        used for the embeddings and the LLM.
     CORS_ORIGINS: Optional. Comma-separated frontend origins allowed to call
         the API, e.g. "https://app.example.com". Defaults to local dev servers.
 """
@@ -25,8 +26,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import (
     ChatHuggingFace,
-    HuggingFaceEmbeddings,
     HuggingFaceEndpoint,
+    HuggingFaceEndpointEmbeddings,
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
@@ -41,6 +42,15 @@ logger = logging.getLogger(__name__)
 # by Hugging Face Inference Providers. The "Instruct" variant answers directly
 # (no <think> reasoning blocks in the output).
 LLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+
+# Multilingual embedding model, so Spanish questions match the English docs.
+# Computed remotely by Hugging Face (no local PyTorch), which keeps the app
+# small enough for 512 MB free hosting tiers.
+EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+# Chunks embedded per API request at startup (the client sends each call's
+# texts in one request, so large corpora are split into batches).
+EMBEDDING_BATCH_SIZE = 64
 
 # {context} and {question} are filled in by RetrievalQA.
 PROMPT = PromptTemplate.from_template(
@@ -59,11 +69,11 @@ Respuesta:"""
 def get_retriever():
   """Build a retriever over the Markdown files in ./docs_angular.
 
-  Pipeline: load .md files -> split into chunks -> embed locally with
-  MiniLM -> index in an in-memory FAISS store.
+  Pipeline: load .md files -> split into chunks -> embed with the Hugging
+  Face Inference API -> index in an in-memory FAISS store.
 
-  This is expensive (loads the embedding model and embeds every doc), so it
-  runs once at startup. Restart the server to pick up changes to the docs.
+  This embeds every doc over the network, so it runs once at startup.
+  Restart the server to pick up changes to the docs.
 
   Note: the path is relative to the current working directory, not this file.
   """
@@ -77,11 +87,14 @@ def get_retriever():
   splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
   chunks = splitter.split_documents(documents)
 
-  # Runs locally (downloaded on first use); no API key required.
-  embeddings = HuggingFaceEmbeddings(
-      model_name="sentence-transformers/all-MiniLM-L6-v2"
+  embeddings = HuggingFaceEndpointEmbeddings(
+      model=EMBEDDING_MODEL,
+      provider="hf-inference",
+      huggingfacehub_api_token=os.environ["HF_API_KEY"],
   )
-  vector_store = FAISS.from_documents(chunks, embeddings)
+  vector_store = FAISS.from_documents(chunks[:EMBEDDING_BATCH_SIZE], embeddings)
+  for start in range(EMBEDDING_BATCH_SIZE, len(chunks), EMBEDDING_BATCH_SIZE):
+    vector_store.add_documents(chunks[start : start + EMBEDDING_BATCH_SIZE])
 
   # Return the 2 most similar chunks per query to keep the prompt small.
   return vector_store.as_retriever(search_kwargs={"k": 2})
@@ -90,6 +103,10 @@ def get_retriever():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
   """Build the retriever once before the server starts accepting requests."""
+  # Both the embeddings (at startup) and the LLM (per request) need the key,
+  # so refuse to start without it rather than fail on every request.
+  if not os.getenv("HF_API_KEY"):
+    raise RuntimeError("HF_API_KEY is not set (see src/.env.example)")
   app.state.retriever = get_retriever()
   yield
 
@@ -130,12 +147,6 @@ def ask_tutor(body: QueryRequest, request: Request):
   Returns the LLM answer ("respuesta") and the raw text of the chunks it was
   given ("fuentes"), so the client can show sources.
   """
-  # Fail fast with a clear message instead of an opaque auth error from HF.
-  if not os.getenv("HF_API_KEY"):
-    raise HTTPException(
-        status_code=500, detail="Falta configurar HF_API_KEY en el servidor"
-    )
-
   try:
     # The LLM client and chain are cheap to create (no model download; it's a
     # remote API), so they're built per request with the current key.
@@ -145,7 +156,7 @@ def ask_tutor(body: QueryRequest, request: Request):
         llm=HuggingFaceEndpoint(
             repo_id=LLM_MODEL,
             provider="auto",  # let Hugging Face pick an available provider
-            huggingfacehub_api_token=os.getenv("HF_API_KEY"),
+            huggingfacehub_api_token=os.environ["HF_API_KEY"],
             temperature=0.1,
             max_new_tokens=512,
         )
