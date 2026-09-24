@@ -1,0 +1,38 @@
+[project]
+name = "api-dev-tutor-bot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Maximino Castillo", email = "maxcastgarcia@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "faiss-cpu>=1.13.0",
+    "fastapi[standard]>=0.141.1",
+    "langchain-classic>=1.0.8",
+    "langchain-community>=0.4.2",
+    "langchain-huggingface>=1.2.2",
+    "langchain-text-splitters>=1.1.2",
+    "python-dotenv>=1.2.1",
+    "sentence-transformers>=6.1.0",
+    "torch>=2.14.0",
+]
+
+# On Linux (e.g. the Docker image), install CPU-only PyTorch instead of the
+# default CUDA build, which adds several GB of unused GPU libraries.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.fastapi]
+entrypoint = "src.server:app"
+
+# This is an application, not a library: uv installs dependencies only and
+# does not build/install the project itself.
+[tool.uv]
+package = false
