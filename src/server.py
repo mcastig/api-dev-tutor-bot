@@ -5,6 +5,12 @@ Retrieval-Augmented Generation (RAG): relevant snippets are retrieved from
 local Markdown docs and passed as context to a small LLM served by Hugging
 Face Inference Providers.
 
+The pipeline is written out step by step (no RAG framework):
+  1. Load the knowledge base and split it into fragments.
+  2. Embed every fragment once, at startup.
+  3. For each question, find the most similar fragments (dot product).
+  4. Build a prompt with those fragments and ask the LLM.
+
 Environment variables (loaded from src/.env):
     HF_API_KEY: Required. Hugging Face access token (read access is enough)
         used for the embeddings and the LLM.
@@ -17,18 +23,11 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_classic.chains import RetrievalQA
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate
-from langchain_huggingface import (
-    ChatHuggingFace,
-    HuggingFaceEndpoint,
-    HuggingFaceEndpointEmbeddings,
-)
+from huggingface_hub import InferenceClient
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 
@@ -48,13 +47,17 @@ LLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 # small enough for 512 MB free hosting tiers.
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-# Chunks embedded per API request at startup (the client sends each call's
+# Chunks embedded per API request at startup (each call sends all of its
 # texts in one request, so large corpora are split into batches).
 EMBEDDING_BATCH_SIZE = 64
 
-# {context} and {question} are filled in by RetrievalQA.
-PROMPT = PromptTemplate.from_template(
-    """Eres DevTutor Bot, un Desarrollador Frontend Senior experto en Angular y TypeScript.
+# Fragments passed to the LLM per question; kept small to keep the prompt small.
+TOP_K = 2
+
+# Knowledge base; the path is relative to the current working directory.
+DOCS_DIR = Path("./docs_angular")
+
+PROMPT = """Eres DevTutor Bot, un Desarrollador Frontend Senior experto en Angular y TypeScript.
 Usa estrictamente la documentación provista para responder. Si no lo sabes, dilo.
 
 Contexto:
@@ -63,53 +66,107 @@ Contexto:
 Pregunta:
 {question}
 Respuesta:"""
-)
 
 
-def get_retriever():
-  """Build a retriever over the Markdown files in ./docs_angular.
+# ---- 1. Knowledge base -------------------------------------------------------
 
-  Pipeline: load .md files -> split into chunks -> embed with the Hugging
-  Face Inference API -> index in an in-memory FAISS store.
 
-  This embeds every doc over the network, so it runs once at startup.
-  Restart the server to pick up changes to the docs.
+def load_fragments() -> list[str]:
+  """Read every .md file in DOCS_DIR and split it into ~500-char fragments.
 
-  Note: the path is relative to the current working directory, not this file.
+  A small overlap keeps sentences cut at a boundary intact in at least one
+  fragment.
   """
-  loader = DirectoryLoader(
-      "./docs_angular", glob="**/*.md", loader_cls=TextLoader
-  )
-  documents = loader.load()
+  paths = sorted(DOCS_DIR.glob("**/*.md"))
+  if not paths:
+    raise RuntimeError(f"No .md files found in {DOCS_DIR.resolve()}")
 
-  # ~500-char chunks with a small overlap so sentences cut at a boundary
-  # still appear intact in at least one chunk.
   splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-  chunks = splitter.split_documents(documents)
+  fragments = []
+  for path in paths:
+    fragments.extend(splitter.split_text(path.read_text(encoding="utf-8")))
+  return fragments
 
-  embeddings = HuggingFaceEndpointEmbeddings(
-      model=EMBEDDING_MODEL,
-      provider="hf-inference",
-      huggingfacehub_api_token=os.environ["HF_API_KEY"],
+
+# ---- 2. Embeddings -----------------------------------------------------------
+
+
+def embed(client: InferenceClient, texts: list[str]) -> np.ndarray:
+  """Embed texts remotely, returning one L2-normalized row per text.
+
+  Normalizing makes the dot product in search_fragments() equal to cosine
+  similarity, so fragment length doesn't skew the ranking.
+  """
+  batches = [
+      client.feature_extraction(
+          texts[start : start + EMBEDDING_BATCH_SIZE], model=EMBEDDING_MODEL
+      )
+      for start in range(0, len(texts), EMBEDDING_BATCH_SIZE)
+  ]
+  vectors = np.vstack(batches).astype(np.float32)
+  return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+
+
+# ---- 3. Retrieval ------------------------------------------------------------
+
+
+def search_fragments(question: str, state) -> list[str]:
+  """Return the TOP_K fragments most similar to the question."""
+  question_vector = embed(state.embeddings_client, [question])[0]
+  similarities = state.fragment_vectors @ question_vector
+  best = np.argsort(similarities)[::-1][:TOP_K]
+  return [state.fragments[i] for i in best]
+
+
+# ---- 4. Generation -----------------------------------------------------------
+
+
+def assistant(question: str, state) -> dict:
+  """RAG: retrieve fragments for the question, then answer from them."""
+  fragments = search_fragments(question, state)
+  prompt = PROMPT.format(context="\n\n".join(fragments), question=question)
+
+  # Low temperature keeps answers close to the provided docs; max_tokens caps
+  # answer length (and cost).
+  response = state.llm_client.chat_completion(
+      messages=[{"role": "user", "content": prompt}],
+      model=LLM_MODEL,
+      temperature=0.1,
+      max_tokens=512,
   )
-  vector_store = FAISS.from_documents(chunks[:EMBEDDING_BATCH_SIZE], embeddings)
-  for start in range(EMBEDDING_BATCH_SIZE, len(chunks), EMBEDDING_BATCH_SIZE):
-    vector_store.add_documents(chunks[start : start + EMBEDDING_BATCH_SIZE])
+  return {
+      "respuesta": response.choices[0].message.content,
+      "fuentes": fragments,
+  }
 
-  # Return the 2 most similar chunks per query to keep the prompt small.
-  return vector_store.as_retriever(search_kwargs={"k": 2})
+
+# ---- API ---------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-  """Build the retriever once before the server starts accepting requests."""
-  # Both the embeddings (at startup) and the LLM (per request) need the key,
-  # so refuse to start without it rather than fail on every request.
-  if not os.getenv("HF_API_KEY"):
-    raise RuntimeError("HF_API_KEY is not set (see src/.env.example)")
-  app.state.retriever = get_retriever()
-  yield
+  """Embed the knowledge base once before the server accepts requests.
 
+  Restart the server to pick up changes to the docs.
+  """
+  # Both the embeddings and the LLM need the key, so refuse to start without
+  # it rather than fail on every request.
+  api_key = os.getenv("HF_API_KEY")
+  if not api_key:
+    raise RuntimeError("HF_API_KEY is not set (see src/.env.example)")
+
+  app.state.embeddings_client = InferenceClient(
+      provider="hf-inference", api_key=api_key
+  )
+  # "auto" lets Hugging Face pick an available provider for the LLM.
+  app.state.llm_client = InferenceClient(provider="auto", api_key=api_key)
+
+  app.state.fragments = load_fragments()
+  app.state.fragment_vectors = embed(
+      app.state.embeddings_client, app.state.fragments
+  )
+  logger.info("Embedded %d fragments", len(app.state.fragments))
+  yield
 
 app = FastAPI(title="DevTutor Bot API", version="1.0", lifespan=lifespan)
 
@@ -145,40 +202,11 @@ class QueryRequest(BaseModel):
 def ask_tutor(body: QueryRequest, request: Request):
   """Answer a question using retrieved docs as context.
 
-  Returns the LLM answer ("respuesta") and the raw text of the chunks it was
-  given ("fuentes"), so the client can show sources.
+  Returns the LLM answer ("respuesta") and the raw text of the fragments it
+  was given ("fuentes"), so the client can show sources.
   """
   try:
-    # The LLM client and chain are cheap to create (no model download; it's a
-    # remote API), so they're built per request with the current key.
-    # Low temperature keeps answers close to the provided docs; max_new_tokens
-    # caps answer length (and cost).
-    llm = ChatHuggingFace(
-        llm=HuggingFaceEndpoint(
-            repo_id=LLM_MODEL,
-            provider="auto",  # let Hugging Face pick an available provider
-            huggingfacehub_api_token=os.environ["HF_API_KEY"],
-            temperature=0.1,
-            max_new_tokens=512,
-        )
-    )
-
-    # "stuff" = concatenate all retrieved chunks into a single prompt.
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=request.app.state.retriever,
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": PROMPT},
-    )
-
-    result = qa_chain.invoke({"query": body.pregunta})
-    return {
-        "respuesta": result["result"],
-        "fuentes": [
-            doc.page_content for doc in result["source_documents"]
-        ],
-    }
+    return assistant(body.pregunta, request.app.state)
   except Exception:
     # Log the full traceback server-side, but return a generic message so
     # internal details (paths, provider errors, keys) never reach clients.
@@ -191,5 +219,5 @@ def ask_tutor(body: QueryRequest, request: Request):
 
 @app.get("/api/health")
 def health_check():
-  """Liveness probe; does not check the LLM provider or the vector store."""
+  """Liveness probe; does not check the LLM provider or the embeddings."""
   return {"status": "online", "service": "DevTutor Bot API"}
