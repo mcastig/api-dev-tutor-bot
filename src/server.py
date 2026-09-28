@@ -341,8 +341,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="DevTutor Bot API", version="1.0", lifespan=lifespan)
 
 # Origins must match exactly (scheme + host + port, no trailing slash).
-# Defaults cover the Vite (5173) and Create React App (3000) dev servers.
-DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://localhost:3000"
+# Defaults cover the production frontend on Vercel and the Vite (5173) and
+# Create React App (3000) dev servers.
+DEFAULT_CORS_ORIGINS = ",".join([
+    "https://frontend-dev-tutor-bot.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+])
 CORS_ORIGINS = [
     origin.strip().rstrip("/")
     # `or`, not a getenv default, so an empty CORS_ORIGINS also uses the defaults.

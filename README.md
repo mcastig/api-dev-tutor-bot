@@ -100,7 +100,7 @@ Returns `{"status": "online", "service": "DevTutor Bot API"}`. It only checks th
 | `FINETUNED_ADAPTER` | No | Path or Hub repo id of the LoRA adapter for `USE_FINETUNED=1`. Defaults to `./models/devtutor-lora`. |
 | `GROQ_API_KEY` | No | Only for `scripts/generate_dataset.py`: Groq key for the teacher model. |
 | `TEACHER_MODEL` | No | Only for `scripts/generate_dataset.py`: Groq model that writes the dataset. Defaults to `qwen/qwen3.8-27b`. |
-| `CORS_ORIGINS` | No | Comma-separated origins allowed to call the API from a browser, e.g. `https://app.example.com`. Must match exactly (scheme, host, and port). Defaults to `http://localhost:5173,http://localhost:3000` (Vite and Create React App dev servers). |
+| `CORS_ORIGINS` | No | Comma-separated origins allowed to call the API from a browser, e.g. `https://app.example.com`. Must match exactly (scheme, host, and port). Defaults to `https://frontend-dev-tutor-bot.vercel.app,http://localhost:5173,http://localhost:3000` (the production frontend plus the Vite and Create React App dev servers). Setting it replaces the defaults, so include every origin you need. |
 
 Locally, these are read from `src/.env`, which is git-ignored. In Docker, pass them with `-e`.
 
