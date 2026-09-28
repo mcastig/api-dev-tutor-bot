@@ -27,3 +27,6 @@ wheels/
 
 # OS files
 .DS_Store
+
+# Fine-tuned LoRA adapters (downloaded from the Colab notebook)
+models/

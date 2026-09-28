@@ -2,8 +2,7 @@
 
 A FastAPI service that answers Angular/TypeScript questions using
 Retrieval-Augmented Generation (RAG): relevant snippets are retrieved from
-local Markdown docs and passed as context to a small LLM served by Hugging
-Face Inference Providers.
+local Markdown docs and passed as context to a small LLM.
 
 The pipeline is written out step by step (no RAG framework):
   1. Load the knowledge base and split it into fragments.
@@ -11,15 +10,26 @@ The pipeline is written out step by step (no RAG framework):
   3. For each question, find the most similar fragments (dot product).
   4. Build a prompt with those fragments and ask the LLM.
 
+Models run in one of two modes:
+  - Remote (default, used on Render): embeddings and the LLM are Hugging Face
+    API calls, so the app needs no PyTorch and fits in 512 MB.
+  - Local (USE_FINETUNED=1): embeddings and our LoRA fine-tuned model run on
+    this machine. Needs `uv sync --group finetuned` and a trained adapter
+    (see notebooks/fine_tuning.ipynb). No API key or credits needed.
+
 Environment variables (loaded from src/.env):
-    HF_API_KEY: Required. Hugging Face access token (read access is enough)
-        used for the embeddings and the LLM.
+    HF_API_KEY: Required in remote mode. Hugging Face access token (read
+        access is enough) used for the embeddings and the LLM.
+    USE_FINETUNED: Optional. "1" switches to local mode.
+    FINETUNED_ADAPTER: Optional. Path (or Hub repo id) of the LoRA adapter
+        used in local mode. Defaults to ./models/devtutor-lora.
     CORS_ORIGINS: Optional. Comma-separated frontend origins allowed to call
         the API, e.g. "https://app.example.com". Defaults to local dev servers.
 """
 
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -42,9 +52,11 @@ logger = logging.getLogger(__name__)
 # (no <think> reasoning blocks in the output).
 LLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 
+# LoRA adapter trained on top of Qwen/Qwen2.5-1.5B-Instruct (the base model is
+# read from the adapter's config). Only used in local mode.
+DEFAULT_FINETUNED_ADAPTER = "./models/devtutor-lora"
+
 # Multilingual embedding model, so Spanish questions match the English docs.
-# Computed remotely by Hugging Face (no local PyTorch), which keeps the app
-# small enough for 512 MB free hosting tiers.
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 # Chunks embedded per API request at startup (each call sends all of its
@@ -54,9 +66,14 @@ EMBEDDING_BATCH_SIZE = 64
 # Fragments passed to the LLM per question; kept small to keep the prompt small.
 TOP_K = 2
 
+# Longest answer, in tokens; caps latency (and cost in remote mode).
+MAX_ANSWER_TOKENS = 512
+
 # Knowledge base; the path is relative to the current working directory.
 DOCS_DIR = Path("./docs_angular")
 
+# Also used to build the fine-tuning dataset (scripts/generate_dataset.py),
+# so the fine-tuned model is trained on exactly this format.
 PROMPT = """Eres DevTutor Bot, un Desarrollador Frontend Senior experto en Angular y TypeScript.
 Usa estrictamente la documentación provista para responder. Si no lo sabes, dilo.
 
@@ -88,23 +105,94 @@ def load_fragments() -> list[str]:
   return fragments
 
 
-# ---- 2. Embeddings -----------------------------------------------------------
+# ---- 2. Models (embeddings + LLM) --------------------------------------------
+#
+# Both classes expose the same two methods:
+#   embed(texts) -> one L2-normalized row per text. Normalizing makes the dot
+#       product in search_fragments() equal to cosine similarity, so fragment
+#       length doesn't skew the ranking.
+#   generate(prompt) -> the LLM's answer.
 
 
-def embed(client: InferenceClient, texts: list[str]) -> np.ndarray:
-  """Embed texts remotely, returning one L2-normalized row per text.
+class RemoteModels:
+  """Embeddings and LLM served by Hugging Face (uses HF credits)."""
 
-  Normalizing makes the dot product in search_fragments() equal to cosine
-  similarity, so fragment length doesn't skew the ranking.
-  """
-  batches = [
-      client.feature_extraction(
-          texts[start : start + EMBEDDING_BATCH_SIZE], model=EMBEDDING_MODEL
+  def __init__(self, api_key: str):
+    self.embeddings_client = InferenceClient(
+        provider="hf-inference", api_key=api_key
+    )
+    # "auto" lets Hugging Face pick an available provider for the LLM.
+    self.llm_client = InferenceClient(provider="auto", api_key=api_key)
+
+  def embed(self, texts: list[str]) -> np.ndarray:
+    batches = [
+        self.embeddings_client.feature_extraction(
+            texts[start : start + EMBEDDING_BATCH_SIZE], model=EMBEDDING_MODEL
+        )
+        for start in range(0, len(texts), EMBEDDING_BATCH_SIZE)
+    ]
+    vectors = np.vstack(batches).astype(np.float32)
+    return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+
+  def generate(self, prompt: str) -> str:
+    # Low temperature keeps answers close to the provided docs.
+    response = self.llm_client.chat_completion(
+        messages=[{"role": "user", "content": prompt}],
+        model=LLM_MODEL,
+        temperature=0.1,
+        max_tokens=MAX_ANSWER_TOKENS,
+    )
+    return response.choices[0].message.content
+
+
+class LocalModels:
+  """Embeddings and the LoRA fine-tuned LLM running on this machine."""
+
+  def __init__(self, adapter: str):
+    # Imported here so remote mode (and the Docker image) never needs them.
+    import torch
+    from peft import AutoPeftModelForCausalLM
+    from sentence_transformers import SentenceTransformer
+    from transformers import AutoTokenizer
+
+    self.embedder = SentenceTransformer(EMBEDDING_MODEL)
+
+    # Apple GPU (MPS) or NVIDIA (CUDA) if available, else CPU.
+    if torch.backends.mps.is_available():
+      device, dtype = "mps", torch.float16
+    elif torch.cuda.is_available():
+      device, dtype = "cuda", torch.float16
+    else:
+      device, dtype = "cpu", torch.float32
+    # Loads the base model named in the adapter's config, then applies the
+    # adapter; merging makes generation as fast as a plain model.
+    model = AutoPeftModelForCausalLM.from_pretrained(adapter, dtype=dtype)
+    self.model = model.merge_and_unload().to(device).eval()
+    self.tokenizer = AutoTokenizer.from_pretrained(adapter)
+    # generate() isn't safe to run concurrently on one model, and FastAPI runs
+    # sync endpoints in a thread pool.
+    self.lock = threading.Lock()
+    logger.info("Loaded fine-tuned model from %s on %s", adapter, device)
+
+  def embed(self, texts: list[str]) -> np.ndarray:
+    return self.embedder.encode(
+        texts, normalize_embeddings=True, show_progress_bar=False
+    )
+
+  def generate(self, prompt: str) -> str:
+    inputs = self.tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    ).to(self.model.device)
+    with self.lock:
+      # Greedy decoding: deterministic and close to the training answers.
+      output = self.model.generate(
+          **inputs, max_new_tokens=MAX_ANSWER_TOKENS, do_sample=False
       )
-      for start in range(0, len(texts), EMBEDDING_BATCH_SIZE)
-  ]
-  vectors = np.vstack(batches).astype(np.float32)
-  return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+    new_tokens = output[0][inputs["input_ids"].shape[1] :]
+    return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
 # ---- 3. Retrieval ------------------------------------------------------------
@@ -112,7 +200,7 @@ def embed(client: InferenceClient, texts: list[str]) -> np.ndarray:
 
 def search_fragments(question: str, state) -> list[str]:
   """Return the TOP_K fragments most similar to the question."""
-  question_vector = embed(state.embeddings_client, [question])[0]
+  question_vector = state.models.embed([question])[0]
   similarities = state.fragment_vectors @ question_vector
   best = np.argsort(similarities)[::-1][:TOP_K]
   return [state.fragments[i] for i in best]
@@ -125,17 +213,8 @@ def assistant(question: str, state) -> dict:
   """RAG: retrieve fragments for the question, then answer from them."""
   fragments = search_fragments(question, state)
   prompt = PROMPT.format(context="\n\n".join(fragments), question=question)
-
-  # Low temperature keeps answers close to the provided docs; max_tokens caps
-  # answer length (and cost).
-  response = state.llm_client.chat_completion(
-      messages=[{"role": "user", "content": prompt}],
-      model=LLM_MODEL,
-      temperature=0.1,
-      max_tokens=512,
-  )
   return {
-      "respuesta": response.choices[0].message.content,
+      "respuesta": state.models.generate(prompt),
       "fuentes": fragments,
   }
 
@@ -145,28 +224,27 @@ def assistant(question: str, state) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-  """Embed the knowledge base once before the server accepts requests.
+  """Load the models and embed the knowledge base before serving requests.
 
   Restart the server to pick up changes to the docs.
   """
-  # Both the embeddings and the LLM need the key, so refuse to start without
-  # it rather than fail on every request.
-  api_key = os.getenv("HF_API_KEY")
-  if not api_key:
-    raise RuntimeError("HF_API_KEY is not set (see src/.env.example)")
-
-  app.state.embeddings_client = InferenceClient(
-      provider="hf-inference", api_key=api_key
-  )
-  # "auto" lets Hugging Face pick an available provider for the LLM.
-  app.state.llm_client = InferenceClient(provider="auto", api_key=api_key)
+  if os.getenv("USE_FINETUNED") == "1":
+    app.state.models = LocalModels(
+        os.getenv("FINETUNED_ADAPTER") or DEFAULT_FINETUNED_ADAPTER
+    )
+  else:
+    # Both the embeddings and the LLM need the key, so refuse to start
+    # without it rather than fail on every request.
+    api_key = os.getenv("HF_API_KEY")
+    if not api_key:
+      raise RuntimeError("HF_API_KEY is not set (see src/.env.example)")
+    app.state.models = RemoteModels(api_key)
 
   app.state.fragments = load_fragments()
-  app.state.fragment_vectors = embed(
-      app.state.embeddings_client, app.state.fragments
-  )
+  app.state.fragment_vectors = app.state.models.embed(app.state.fragments)
   logger.info("Embedded %d fragments", len(app.state.fragments))
   yield
+
 
 app = FastAPI(title="DevTutor Bot API", version="1.0", lifespan=lifespan)
 

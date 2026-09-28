@@ -17,3 +17,4 @@ dist/
 .dockerignore
 Dockerfile
 CLAUDE.md
+models/

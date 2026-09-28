@@ -23,3 +23,12 @@ entrypoint = "src.server:app"
 [tool.uv]
 package = false
 
+[dependency-groups]
+finetuned = [
+    "accelerate>=1.15.0",
+    "peft>=0.21.0",
+    "sentence-transformers>=6.1.0",
+    "torch>=2.14.0",
+    "transformers>=5",
+    "trl>=1.14.0",
+]
