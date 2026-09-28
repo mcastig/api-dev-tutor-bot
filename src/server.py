@@ -27,6 +27,7 @@ Environment variables (loaded from src/.env):
         the API, e.g. "https://app.example.com". Defaults to local dev servers.
 """
 
+import json
 import logging
 import os
 import threading
@@ -59,6 +60,10 @@ DEFAULT_FINETUNED_ADAPTER = "./models/devtutor-lora"
 # Multilingual embedding model, so Spanish questions match the English docs.
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
+# Fragment size and overlap, in characters.
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 50
+
 # Chunks embedded per API request at startup (each call sends all of its
 # texts in one request, so large corpora are split into batches).
 EMBEDDING_BATCH_SIZE = 64
@@ -68,6 +73,10 @@ TOP_K = 2
 
 # Longest answer, in tokens; caps latency (and cost in remote mode).
 MAX_ANSWER_TOKENS = 512
+
+# Low temperature keeps remote answers close to the provided docs (local mode
+# uses greedy decoding, the equivalent of temperature 0).
+LLM_TEMPERATURE = 0.1
 
 # Knowledge base; the path is relative to the current working directory.
 DOCS_DIR = Path("./docs_angular")
@@ -88,17 +97,24 @@ Respuesta:"""
 # ---- 1. Knowledge base -------------------------------------------------------
 
 
+def list_docs() -> list[Path]:
+  """The knowledge base's Markdown files, in a stable order."""
+  return sorted(DOCS_DIR.glob("**/*.md"))
+
+
 def load_fragments() -> list[str]:
   """Read every .md file in DOCS_DIR and split it into ~500-char fragments.
 
   A small overlap keeps sentences cut at a boundary intact in at least one
   fragment.
   """
-  paths = sorted(DOCS_DIR.glob("**/*.md"))
+  paths = list_docs()
   if not paths:
     raise RuntimeError(f"No .md files found in {DOCS_DIR.resolve()}")
 
-  splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+  splitter = RecursiveCharacterTextSplitter(
+      chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+  )
   fragments = []
   for path in paths:
     fragments.extend(splitter.split_text(path.read_text(encoding="utf-8")))
@@ -107,11 +123,48 @@ def load_fragments() -> list[str]:
 
 # ---- 2. Models (embeddings + LLM) --------------------------------------------
 #
-# Both classes expose the same two methods:
+# Both classes expose the same methods:
 #   embed(texts) -> one L2-normalized row per text. Normalizing makes the dot
 #       product in search_fragments() equal to cosine similarity, so fragment
 #       length doesn't skew the ranking.
 #   generate(prompt) -> the LLM's answer.
+#   describe() -> mode, embeddings and LLM details for /api/info.
+
+
+def describe_adapter(adapter: str) -> dict | None:
+  """LoRA and training details of a fine-tuned adapter, or None if missing.
+
+  Reads adapter_config.json (written by peft) and, if present,
+  training_info.json (written by notebooks/fine_tuning.ipynb) from a local
+  directory or a Hub repo. Needs no PyTorch.
+  """
+
+  def read_json(name: str) -> dict | None:
+    path = Path(adapter) / name
+    try:
+      if not path.is_file():
+        from huggingface_hub import hf_hub_download
+
+        path = Path(hf_hub_download(adapter, name))
+      return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # not downloaded/trained yet, or not a Hub repo
+      return None
+
+  config = read_json("adapter_config.json")
+  if config is None:
+    return None
+  return {
+      "adapter": adapter,
+      "base_model": config.get("base_model_name_or_path"),
+      "method": config.get("peft_type"),
+      "lora": {
+          "r": config.get("r"),
+          "lora_alpha": config.get("lora_alpha"),
+          "lora_dropout": config.get("lora_dropout"),
+          "target_modules": sorted(config.get("target_modules") or []),
+      },
+      "training": read_json("training_info.json"),
+  }
 
 
 class RemoteModels:
@@ -124,6 +177,19 @@ class RemoteModels:
     # "auto" lets Hugging Face pick an available provider for the LLM.
     self.llm_client = InferenceClient(provider="auto", api_key=api_key)
 
+  def describe(self) -> dict:
+    return {
+        "mode": "remote",
+        "embeddings_runtime": "Hugging Face Inference API (hf-inference)",
+        "llm": {
+            "model": LLM_MODEL,
+            "runtime": "Hugging Face Inference Providers (provider=auto)",
+            "fine_tuned": False,
+            "temperature": LLM_TEMPERATURE,
+            "max_new_tokens": MAX_ANSWER_TOKENS,
+        },
+    }
+
   def embed(self, texts: list[str]) -> np.ndarray:
     batches = [
         self.embeddings_client.feature_extraction(
@@ -135,11 +201,10 @@ class RemoteModels:
     return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
 
   def generate(self, prompt: str) -> str:
-    # Low temperature keeps answers close to the provided docs.
     response = self.llm_client.chat_completion(
         messages=[{"role": "user", "content": prompt}],
         model=LLM_MODEL,
-        temperature=0.1,
+        temperature=LLM_TEMPERATURE,
         max_tokens=MAX_ANSWER_TOKENS,
     )
     return response.choices[0].message.content
@@ -167,12 +232,39 @@ class LocalModels:
     # Loads the base model named in the adapter's config, then applies the
     # adapter; merging makes generation as fast as a plain model.
     model = AutoPeftModelForCausalLM.from_pretrained(adapter, dtype=dtype)
+    # Count before merging, which folds the LoRA weights into the base ones.
+    lora_params = sum(
+        p.numel() for name, p in model.named_parameters() if "lora_" in name
+    )
     self.model = model.merge_and_unload().to(device).eval()
     self.tokenizer = AutoTokenizer.from_pretrained(adapter)
+    self.adapter = adapter
+    self.base_model = model.peft_config["default"].base_model_name_or_path
+    self.device, self.dtype = device, str(dtype).removeprefix("torch.")
+    self.params = {
+        "base": self.model.num_parameters(),
+        "lora": lora_params,
+        "lora_percent": round(100 * lora_params / self.model.num_parameters(), 2),
+    }
     # generate() isn't safe to run concurrently on one model, and FastAPI runs
     # sync endpoints in a thread pool.
     self.lock = threading.Lock()
     logger.info("Loaded fine-tuned model from %s on %s", adapter, device)
+
+  def describe(self) -> dict:
+    return {
+        "mode": "local_finetuned",
+        "embeddings_runtime": "local (sentence-transformers)",
+        "llm": {
+            "model": self.base_model,
+            "adapter": self.adapter,
+            "runtime": f"local transformers on {self.device} ({self.dtype})",
+            "fine_tuned": True,
+            "parameters": self.params,
+            "decoding": "greedy (do_sample=False)",
+            "max_new_tokens": MAX_ANSWER_TOKENS,
+        },
+    }
 
   def embed(self, texts: list[str]) -> np.ndarray:
     return self.embedder.encode(
@@ -293,6 +385,56 @@ def ask_tutor(body: QueryRequest, request: Request):
         status_code=500,
         detail="Ocurrió un error al procesar la pregunta. Inténtalo de nuevo.",
     )
+
+
+@app.get("/api/info")
+def info(request: Request):
+  """Describe the RAG pipeline, the models and the fine-tuning setup.
+
+  Everything comes from the running configuration, so it always matches
+  what /api/ask actually does. Never includes API keys.
+  """
+  state = request.app.state
+  models = state.models.describe()
+  adapter = os.getenv("FINETUNED_ADAPTER") or DEFAULT_FINETUNED_ADAPTER
+  adapter_info = describe_adapter(adapter)
+  return {
+      "service": "DevTutor Bot API",
+      "mode": models["mode"],
+      "rag": {
+          "knowledge_base": {
+              "directory": str(DOCS_DIR),
+              "files": [path.name for path in list_docs()],
+              "fragments": len(state.fragments),
+          },
+          "chunking": {
+              "splitter": "RecursiveCharacterTextSplitter",
+              "chunk_size": CHUNK_SIZE,
+              "chunk_overlap": CHUNK_OVERLAP,
+          },
+          "embeddings": {
+              "model": EMBEDDING_MODEL,
+              "dimensions": int(state.fragment_vectors.shape[1]),
+              "runtime": models["embeddings_runtime"],
+              "normalized": True,
+          },
+          "retrieval": {
+              "vector_store": "in-memory NumPy matrix",
+              "similarity": "cosine (dot product of L2-normalized vectors)",
+              "top_k": TOP_K,
+          },
+          "prompt_template": PROMPT,
+      },
+      "llm": models["llm"],
+      "fine_tuning": {
+          # Served only in local mode (USE_FINETUNED=1); the adapter's
+          # details are shown whenever its files are available.
+          "enabled": models["mode"] == "local_finetuned",
+          "notebook": "notebooks/fine_tuning.ipynb",
+          "dataset_script": "scripts/generate_dataset.py",
+          **(adapter_info or {"adapter": None}),
+      },
+  }
 
 
 @app.get("/api/health")
