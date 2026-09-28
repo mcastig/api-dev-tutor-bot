@@ -2,10 +2,9 @@
 
 A FastAPI backend for **DevTutor Bot**, a tutor that answers Angular and TypeScript questions in Spanish. It uses Retrieval-Augmented Generation (RAG): each question is matched against a local knowledge base built from the official Angular and TypeScript documentation, and the most relevant passages are sent to a small LLM, which answers from them.
 
-It's designed to be called by a separate React frontend.
-
 <img width="1536" height="542" alt="Captura de pantalla 2026-09-28 a la(s) 1 10 12 a m" src="https://github.com/user-attachments/assets/4e3fcbee-86aa-486c-86e3-3646e111e702" />
 
+It's designed to be called by a separate React frontend.
 
 ## How it works
 
