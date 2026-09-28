@@ -165,7 +165,11 @@ The fine-tuned model runs on your machine, not on Render (a 1.5B model needs a f
 
    The notebook downloads the dataset from the `main` branch on GitHub, so push it after regenerating (or upload it by hand in Colab).
 
-2. **Train in Colab.** Open [`notebooks/fine_tuning.ipynb`](notebooks/fine_tuning.ipynb) in Google Colab with a T4 GPU and run all cells. It fine-tunes `Qwen/Qwen2.5-1.5B-Instruct` with LoRA (`peft` + `trl`'s `SFTTrainer`), compares answers before and after, and downloads `devtutor-lora.zip`. The zip also contains `training_info.json` (hyperparameters, loss, dataset size), which `GET /api/info` shows.
+2. **Train in Colab.** Open [`notebooks/fine_tuning.ipynb`](notebooks/fine_tuning.ipynb) in Google Colab, choose **Runtime > Change runtime type > T4 GPU**, and run all cells:
+
+   [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mcastig/api-dev-tutor-bot/blob/main/notebooks/fine_tuning.ipynb)
+
+   It fine-tunes `Qwen/Qwen2.5-1.5B-Instruct` with LoRA (`peft` + `trl`'s `SFTTrainer`), compares answers before and after, and downloads `devtutor-lora.zip`. The zip also contains `training_info.json` (hyperparameters, loss, dataset size), which `GET /api/info` shows.
 
 3. **Run the API with it.** Unzip the adapter into `models/devtutor-lora/` (git-ignored) and start the server in local mode:
 
