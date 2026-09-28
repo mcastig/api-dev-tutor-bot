@@ -4,6 +4,9 @@ A FastAPI backend for **DevTutor Bot**, a tutor that answers Angular and TypeScr
 
 It's designed to be called by a separate React frontend.
 
+<img width="1536" height="542" alt="Captura de pantalla 2026-09-28 a la(s) 1 10 12 a m" src="https://github.com/user-attachments/assets/4e3fcbee-86aa-486c-86e3-3646e111e702" />
+
+
 ## How it works
 
 1. **At startup**, every Markdown file in `docs_angular/` is split into ~500-character chunks, embedded with the multilingual [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) through the Hugging Face Inference API, and kept in memory as a NumPy array. The multilingual model lets Spanish questions match the English docs.
