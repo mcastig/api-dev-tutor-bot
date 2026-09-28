@@ -19,3 +19,4 @@ Dockerfile
 CLAUDE.md
 models/
 scripts/
+data/
